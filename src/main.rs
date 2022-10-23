@@ -42,7 +42,7 @@ pub mod lisp_objects {
             match self {
                 Lisp::Num(n) => format!("{}", n),
                 Lisp::Symbol(id) => ctx.symbols.get_symbol_name(*id),
-                Lisp::Func(id) => format!("<callable:{}>", id),
+                Lisp::Func(id) => ctx.callables[*id].0.to_owned(),
                 Lisp::String(text) => format!("\"{}\"", text),
                 Lisp::List(id) =>
                     format!(
@@ -54,6 +54,19 @@ pub mod lisp_objects {
                             .collect::<Vec<String>>()
                             .join(" ")
                     )
+            }
+        }
+    }
+
+    impl LispError {
+        pub fn print(&self, ctx: &LispContext) -> String {
+            use LispError::*;
+            match self {
+                EvalEmptyList => "Tried to evaluate empty list.".to_owned(),
+                UnboundSymbol(sym) => format!("Symbol `{}` is undefined.", sym.print(ctx)),
+                NotCallable(expr) => format!("Can't call `{}` as a function.", expr.print(ctx)),
+                InvalidArguments(arg_error) => arg_error.print(ctx),
+                OutOfBounds(idx, list) => format!("Index {} out of bounds for list {}", idx, list.print(ctx))
             }
         }
     }
@@ -485,12 +498,12 @@ pub mod lisp_evaluation {
         }
     }
 
-    pub fn call_expression(ctx: &mut LispContext, callable: Lisp, args: &[Lisp]) -> LispResult {
-        let callable_value = evaluate_expression(ctx, callable) ?;
-        match &callable_value {
-            Lisp::Num(_) => Err(LispError::NotCallable(callable_value)),
-            Lisp::String(_) => Err(LispError::NotCallable(callable_value)),
-            Lisp::Symbol(_) => Err(LispError::NotCallable(callable_value)),
+    pub fn call_expression(ctx: &mut LispContext, call: Lisp, args: &[Lisp]) -> LispResult {
+        let callable = evaluate_expression(ctx, call) ?;
+        match &callable {
+            Lisp::Num(_) => Err(LispError::NotCallable(callable)),
+            Lisp::String(_) => Err(LispError::NotCallable(callable)),
+            Lisp::Symbol(_) => Err(LispError::NotCallable(callable)),
 
             Lisp::List(lambda_id) => {
                 let lambda_vec = ctx.lists.get_vec(*lambda_id);
@@ -518,11 +531,11 @@ pub mod lisp_evaluation {
                     // Make sure the number of arguments is correct
                     if args.len() < arg_vars.len() {
                         return Err(LispError::InvalidArguments(
-                            ArgError::TooShort{found: args.len() as u8, min: arg_vars.len() as u8}
+                            ArgError::TooShort{callable, found: args.len() as u8, min: arg_vars.len() as u8}
                         ));
                     } else if args.len() > arg_vars.len() {
                         return Err(LispError::InvalidArguments(
-                            ArgError::TooLong{found: args.len() as u8, max: arg_vars.len() as u8}
+                            ArgError::TooLong{callable, found: args.len() as u8, max: arg_vars.len() as u8}
                         ));
                     }
 
@@ -531,7 +544,7 @@ pub mod lisp_evaluation {
                         arg_vars.iter().zip(args)
                         .map(|(var, arg)| match var {
                             Lisp::Symbol(id) => Ok((*id, arg.clone())),
-                            _                => Err(LispError::NotCallable(callable_value.clone()))
+                            _                => Err(LispError::NotCallable(callable.clone()))
                         }).collect::<Result<Vec<(usize, Lisp)>, LispError>>() ?;
 
                     // The expression is the remainder of the lambda expression
@@ -542,7 +555,7 @@ pub mod lisp_evaluation {
                     evaluate_with(ctx, expr, bindings)
                         
                 } else {
-                    Err(LispError::NotCallable(callable_value))
+                    Err(LispError::NotCallable(callable))
                 }
             }
 
@@ -557,7 +570,7 @@ pub mod lisp_evaluation {
                 } else { args.to_vec() };
 
                 // Return error if the arguments are invalid
-                if let Err(arg_error) = arg_spec.satisfies(ctx, &evaled_args) {
+                if let Err(arg_error) = arg_spec.satisfies(ctx, callable.clone(), &evaled_args) {
                     Err(LispError::InvalidArguments(arg_error))
                 } else {
                     ctx.callables[*id].3(ctx, &evaled_args)
@@ -687,20 +700,20 @@ pub mod lisp_callables {
 
     #[derive(Debug)]
     pub enum ArgError {
-        TooLong{found: u8, max: u8},
-        TooShort{found: u8, min: u8},
-        Type{idx: u8, error: TypeError},
+        TooLong{callable: Lisp, found: u8, max: u8},
+        TooShort{callable: Lisp, found: u8, min: u8},
+        Type{callable: Lisp, idx: u8, error: TypeError},
     }
 
     impl ArgSpec {
-        pub fn satisfies(&self, ctx: &mut LispContext, args: &[Lisp]) -> Result<(), ArgError> {
+        pub fn satisfies(&self, ctx: &mut LispContext, callable: Lisp, args: &[Lisp]) -> Result<(), ArgError> {
             let ArgSpec{types, extend} = self;
 
             if args.len() < types.len() {
-                Err(ArgError::TooShort{found: args.len() as u8, min: types.len() as u8})
+                Err(ArgError::TooShort{callable, found: args.len() as u8, min: types.len() as u8})
 
             } else if !extend && args.len() > types.len() {
-                Err(ArgError::TooLong{found: args.len() as u8, max: types.len() as u8})
+                Err(ArgError::TooLong{callable, found: args.len() as u8, max: types.len() as u8})
 
             } else {
                 // Make sure the argument types match the required types
@@ -728,10 +741,31 @@ pub mod lisp_callables {
                     None => Ok(()),
                     Some((idx, type_error)) =>
                         Err(ArgError::Type{
+                            callable,
                             idx: idx as u8,
                             error: type_error
                         })
                 }
+            }
+        }
+    }
+
+    impl ArgError {
+        pub fn print(&self, ctx: &LispContext) -> String {
+            use ArgError::*;
+            match self {
+                TooLong{callable, found, max} => format!(
+                    "Called `{}` with {} arguments, but it requires at most {}",
+                    callable.print(ctx), found, max
+                ),
+                TooShort{callable, found, min} => format!(
+                    "Called `{}` with {} arguments, but it requires at least {}",
+                    callable.print(ctx), found, min
+                ),
+                Type{callable, idx, error: TypeError(ltype, obj)} => format!(
+                    "Called `{}` with `{}` as argument {}, but {:?} is required",
+                    callable.print(ctx), obj.print(ctx), idx, ltype
+                )
             }
         }
     }
@@ -768,17 +802,16 @@ pub mod lisp_callables {
              &|ctx: &mut LispContext, args: &[Lisp]|
              if let &[Lisp::Symbol(sym), value] = &args {
                  ctx.symbols.set(Lisp::Symbol(*sym), value.clone());
-                 Ok(Lisp::Symbol(*sym))
+                 Ok(value.clone())
              } else { panic!("{}", ARG_CHECKER_MSG) }
             ),
             (&"setq", false, ArgSpec{types: vec![SymbolP, AnyP], extend: false},
-             &|ctx: &mut LispContext, args: &[Lisp]| {
-                 if let Lisp::Symbol(sym) = args[0] {
-                     let value = evaluate_expression(ctx, args[1].clone()) ?;
-                     ctx.symbols.set(Lisp::Symbol(sym), value.clone());
-                     Ok(Lisp::Symbol(sym))
-                 } else { panic!("{}", ARG_CHECKER_MSG) }
-             }
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if let Lisp::Symbol(sym) = args[0] {
+                 let value = evaluate_expression(ctx, args[1].clone()) ?;
+                 ctx.symbols.set(Lisp::Symbol(sym), value.clone());
+                 Ok(value)
+             } else { panic!("{}", ARG_CHECKER_MSG) }
             ),
             (&"let", false, ArgSpec{
                 // Has the form (let ((SYMBOL ANY) ...) ANY...)
@@ -937,7 +970,7 @@ fn main() {
     // println!("{}", ctx);
 
     for maybe_line in io::stdin().lock().lines() {
-        let line = maybe_line.unwrap();
+        let line = maybe_line.expect("Couldn't read line from stdin!!");
         if let Ok(e) = read_expr(&line, &mut ctx) {
 
             let result = evaluate_expression(&mut ctx, e.clone());
@@ -947,14 +980,15 @@ fn main() {
 
                     // println!("Reading: `{}`", &line);
 
-                    // println!("\n------BEFORE------\n{}------------------\n", ctx);
-                    garbage_collect(&mut ctx);
-                    println!("\n------AFTER-------\n{}------------------\n", ctx.lists);
+                    println!("\n------BEFORE------\n{}------------------\n", ctx.lists);
 
                     println!("Output = {}\n", out.print(&mut ctx));
 
+                    garbage_collect(&mut ctx);
+                    // println!("\n------AFTER-------\n{}------------------\n", ctx.lists);
+
                 }
-                Err(error) => { println!("Error: {:?}", error); }
+                Err(error) => { println!("Error: {}", error.print(&ctx)); }
             }
         }
     }
