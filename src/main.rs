@@ -20,17 +20,19 @@ pub mod lisp_objects {
         /// in lisp are stored as lists starting with the symbol lambda
         Func(usize),
 
-        /// If a function throws an error, it will return this type
+        String(String),
         Error(String),
     }
 
     impl Lisp {
+
         pub fn print(&self, ctx: &LispContext) -> String {
             match self {
                 Lisp::Num(n) => format!("{}", n),
                 Lisp::Symbol(id) => ctx.symbols.get_symbol_name(*id).unwrap(),
                 Lisp::Func(id) => format!("<callable:{}>", id),
-                Lisp::Error(text) => format!("<ERROR:{}>", text),
+                Lisp::String(text) => format!("\"{}\"", text),
+                Lisp::Error(text) => format!("\"{}\"", text),
                 Lisp::List(id) =>
                     format!(
                         "({})",
@@ -291,15 +293,26 @@ pub mod lisp_global {
 }
 
 pub mod lisp_parse{
+    use std::collections::HashMap;
     use crate::lisp_objects::*;
     use crate::lisp_global::LispContext;
 
-    pub fn read_expr(code: &str, ctx: &mut LispContext) -> Option<Lisp> {
-        parse_expr(code, ctx).map(|t| t.0)
+
+    pub enum ParseError {
+        InvalidEscapedChar(char),
+        EmptyExpression,
+        UnclosedList,
+        UnclosedString,
+        MismatchedCloseParen,
     }
     
+    type Parsed<'a> = Result<(Lisp, &'a str), ParseError>;
 
-    type Parsed<'a> = Option<(Lisp, &'a str)>;
+
+    pub fn read_expr(code: &str, ctx: &mut LispContext) -> Result<Lisp, ParseError> {
+        parse_expr(code, ctx).map(|t| t.0)
+    }
+
 
     fn parse_expr<'a>(code: &'a str, ctx: &mut LispContext) -> Parsed<'a> {
         // println!("Parsing: {}", code);
@@ -307,78 +320,106 @@ pub mod lisp_parse{
         let code = code.trim_start();
 
         match code.chars().next() {
-            None => None,
+            None => Err(ParseError::EmptyExpression),
+            Some(')') => Err(ParseError::MismatchedCloseParen),
             Some('(') => {
-                if let Some((mut vec, rest)) = parse_list_tail(&code[1..], ctx) {
-                    vec.reverse();
-                    Some((ctx.lists.store(vec), rest))
-                } else {None}
+                let (mut vec, rest) = parse_list_tail(&code[1..], ctx) ?;
+                vec.reverse();
+                Ok((ctx.lists.store(vec), rest))
             }
             Some('\'') => {
-                if let Some((expr, rest)) = parse_expr(&code[1..], ctx) {
-                    let quote_sym = ctx.symbols.intern("quote");
-                    Some((ctx.lists.store(vec![quote_sym, expr]), rest))
-                } else {None}
+                let (expr, rest) = parse_expr(&code[1..], ctx) ?;
+                let quote_sym = ctx.symbols.intern("quote");
+                Ok((ctx.lists.store(vec![quote_sym, expr]), rest))
             }
-            Some(')') => None,
+            Some('"') => parse_string(code),
             Some(_) => parse_number_or_symbol(code, ctx)
         }
-        
     }
 
-    fn parse_list_tail<'a>(code: &'a str, ctx: &mut LispContext) -> Option<(Vec<Lisp>, &'a str)> {
+    fn parse_list_tail<'a>(code: &'a str, ctx: &mut LispContext) -> Result<(Vec<Lisp>, &'a str), ParseError> {
+        // Remove whitespace from the beginning of the list
         let code = code.trim_start();
 
         // If already finished
         match code.chars().next() {
-            None => { return None; }
-            Some(')') => { return Some((Vec::new(), &code[1..])); }
-            _ => {}
-        }
+            None => Err(ParseError::UnclosedList),
+            Some(')') => Ok((Vec::new(), &code[1..])),
 
-        // Read the next expression
-        if let Some((expr, rest)) = parse_expr(code, ctx) {
+            _ => {
+                // Read the next expression
+                let (expr, rest) = parse_expr(code, ctx) ?;
 
-            if let Some((mut vec, rest2)) = parse_list_tail(rest, ctx) {
+                // Read the remaining text after the next expression
+                let (mut vec, rest2) = parse_list_tail(rest, ctx) ?;
 
                 vec.push(expr);
-                Some((vec, rest2))
-
-            } else {None}
-
-        } else {None}
+                Ok((vec, rest2))
+            }
+        }
     }
 
     fn parse_number_or_symbol<'a>(code: &'a str, ctx: &mut LispContext) -> Parsed<'a> {
         let code = code.trim_start();
-        let non_symbol_chars = vec!['(', ')', ' ', '\n', '\t'];
+        let non_symbol_chars = vec!['(', ')', '\'', '"', ' ', '\n', '\t'];
         
-        let mut idx = 0;
-        for c in code.chars() {
-            if non_symbol_chars.contains(&c) {
-                break;
-            } else {
-                idx += 1;
-            }
-        }
+        // Advance idx until it is the position of the first non-symbol char
+        let maybe_idx = code.chars()
+            .position(|c| non_symbol_chars.contains(&c));
 
-        let text = &code[0..idx];
-        let rest = &code[idx..];
+        // Split the string into the symbol text and remaining code
+        let (text, rest) = match maybe_idx {
+            Some(n) => code.split_at(n),
+            None => (code, "")
+        };
 
         if text == "" {
             // This should never happen, as this function should only
             // be called when there is a valid number/symbol character
-            return None;
+            panic!("Tried to read empty symbol");
 
         } else if let Ok(n) = text.parse::<f64>() {
             // If it is a valid float
-            Some((Lisp::Num(n), rest))
+            Ok((Lisp::Num(n), rest))
 
         } else {
             // Intern and return the symbol
             let lisp_symbol = ctx.symbols.intern(text);
-            Some((lisp_symbol, rest))
+            Ok((lisp_symbol, rest))
         }
+    }
+
+    fn parse_string<'a>(code: &'a str) -> Parsed<'a> {
+        let escaped_chars = [('\\', '\\'), ('"', '"'), ('n', '\n'), ('t', '\t')]
+            .iter().map(|e| e.clone()).collect::<HashMap<char, char>>();
+
+        let mut escape_next = false;
+        let mut string = String::new();
+
+        // Go through the characters in the code
+        for (idx, c) in code[1..].chars().enumerate() {
+
+            // If this character is escaped by a backslash
+            if escape_next {
+                if let Some(newchar) = escaped_chars.get(&c) {
+                    string.push(*newchar);
+                } else {
+                    return Err(ParseError::InvalidEscapedChar(c));
+                }
+
+            } else {
+                match c {
+                    // The end of the string
+                    '"' => { return Ok((Lisp::String(string), &code[1+idx..])); }
+                    // Escape the next character
+                    '\\' => { escape_next = true; }
+                    // Add the current character to the vector
+                    o => { string.push(o); }
+                }
+            }
+        }
+        // If never reached a closing ", return None
+        Err(ParseError::UnclosedString)
     }
 }
 
@@ -423,6 +464,7 @@ pub mod lisp_evaluation {
             Lisp::Error(_) => callable_value,
 
             Lisp::Num(_) => Lisp::Error("Cannot call number.".to_owned()),
+            Lisp::String(_) => Lisp::Error("Cannot call string.".to_owned()),
             Lisp::Symbol(_) => Lisp::Error("Cannot call symbol.".to_owned()),
 
             Lisp::List(lambda_id) => {
@@ -854,7 +896,7 @@ fn main() {
 
     for maybe_line in io::stdin().lock().lines() {
         let line = maybe_line.unwrap();
-        if let Some(e) = read_expr(&line, &mut ctx) {
+        if let Ok(e) = read_expr(&line, &mut ctx) {
             let out = evaluate_expression(&mut ctx, e.clone());
             ctx.symbols.set(out_symbol.clone(), out);
         }
