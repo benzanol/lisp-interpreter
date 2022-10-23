@@ -686,6 +686,25 @@ pub mod lisp_callables {
                 Err(TypeError(self.clone(), obj.clone()))
             }
         }
+
+        fn print(&self) -> String {
+            use LispType::*;
+            match self {
+                AnyP => "Any".to_owned(),
+                NumP => "Num".to_owned(),
+                StringP => "String".to_owned(),
+                SymbolP => "Symbol".to_owned(),
+                ListP(b) => format!("List<{}>", b.print()),
+                TupleP(v) =>
+                    format!(
+                        "Tuple<{}>",
+                        v.iter()
+                            .map(|t| t.print())
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    ),
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -763,8 +782,8 @@ pub mod lisp_callables {
                     callable.print(ctx), found, min
                 ),
                 Type{callable, idx, error: TypeError(ltype, obj)} => format!(
-                    "Called `{}` with `{}` as argument {}, but {:?} is required",
-                    callable.print(ctx), obj.print(ctx), idx, ltype
+                    "Called `{}` with `{}` as argument {}, but {} is required",
+                    callable.print(ctx), obj.print(ctx), idx, ltype.print()
                 )
             }
         }
@@ -798,6 +817,13 @@ pub mod lisp_callables {
              &|ctx: &mut LispContext, args: &[Lisp]|
              Ok(ctx.lists.store([&[ctx.symbols.intern("lambda")], args].concat()))
             ),
+            (&"print", true, ArgSpec{types: vec![AnyP], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]| {
+                 println!("> {}", args[0].print(ctx));
+                 Ok(ctx.symbols.nil_sym())
+             }
+            ),
+
             (&"set", true, ArgSpec{types: vec![SymbolP, AnyP], extend: false},
              &|ctx: &mut LispContext, args: &[Lisp]|
              if let &[Lisp::Symbol(sym), value] = &args {
@@ -824,22 +850,22 @@ pub mod lisp_callables {
                  } else { panic!("{}", ARG_CHECKER_MSG) };
 
                  // Destructure the lisp list into a vector of bindings
-                 let bindings: Vec<(usize, Lisp)> =
-                     bind_vec.iter().map(
-                         |binding|
-                         if let Lisp::List(id) = binding {
-                             if let [Lisp::Symbol(sym), value] = &ctx.lists.get_vec(*id)[..] {
-                                 (*sym, value.clone())
+                 let mut bindings: Vec<(usize, Lisp)> = Vec::with_capacity(bind_vec.len());
+                 for bind_list in bind_vec {
+                     if let Lisp::List(bl_id) = bind_list {
+                         if let [Lisp::Symbol(sym), value] = &ctx.lists.get_vec(bl_id)[..] {
+                             let evaled_value = evaluate_expression(ctx, value.clone()) ?;
+                             bindings.push((*sym, evaled_value));
 
-                             } else { panic!("{}", ARG_CHECKER_MSG) }
                          } else { panic!("{}", ARG_CHECKER_MSG) }
-                     ).collect();
+                     } else { panic!("{}", ARG_CHECKER_MSG) }
+                 }
                  
                  let expr = sequence_expressions(ctx, &args[1..]);
                  evaluate_with(ctx, expr, bindings)
              }
             ),
-            (&"fn", false, ArgSpec{types: vec![ListP(Box::new(SymbolP)), AnyP], extend: true},
+            (&"fn", false, ArgSpec{types: vec![SymbolP, ListP(Box::new(SymbolP)), AnyP], extend: true},
              &|ctx: &mut LispContext, args: &[Lisp]|
              if let Lisp::Symbol(name_id) = args[0] {
                  // Create the vector representing the lambda expression
@@ -854,15 +880,66 @@ pub mod lisp_callables {
                  Ok(Lisp::Symbol(name_id))
              } else { panic!("{}", ARG_CHECKER_MSG) }
             ),
-            (&"print", true, ArgSpec{types: vec![AnyP], extend: false},
+
+            (&"if", false, ArgSpec{types: vec![AnyP, AnyP, AnyP], extend: true},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if evaluate_expression(ctx, args[0].clone()) ? == ctx.symbols.nil_sym() {
+                 let sequence = sequence_expressions(ctx, &args[2..]);
+                 evaluate_expression(ctx, sequence)
+             } else {
+                 evaluate_expression(ctx, args[1].clone())
+             }
+            ),
+            (&"while", false, ArgSpec{types: vec![AnyP], extend: true},
              &|ctx: &mut LispContext, args: &[Lisp]| {
-                 println!("> {}", args[0].print(ctx));
+                 while evaluate_expression(ctx, args[0].clone()) ? != ctx.symbols.intern("nil") {
+                     for a in &args[1..] {
+                         evaluate_expression(ctx, a.clone()) ?;
+                     }
+                 }
+                 Ok(ctx.symbols.intern("nil"))
+             }
+            ),
+            (&"not", true, ArgSpec{types: vec![AnyP], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if args[0] == ctx.symbols.nil_sym() {
+                 Ok(ctx.symbols.true_sym())
+             } else {
                  Ok(ctx.symbols.nil_sym())
              }
             ),
+
             (&"list", true, ArgSpec{types: vec![], extend: true},
              &|ctx: &mut LispContext, args: &[Lisp]|
              Ok(ctx.lists.store(Vec::from(args)))
+            ),
+            (&"cons", true, ArgSpec{types: vec![AnyP, ListP(Box::new(AnyP))], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if let Lisp::List(id) = args[1] {
+                 let mut vec = ctx.lists.get_vec(id);
+                 vec.insert(0, args[0].clone());
+                 Ok(ctx.lists.store(vec))
+             } else { panic!("{}", ARG_CHECKER_MSG) }
+            ),
+            (&"head", true, ArgSpec{types: vec![ListP(Box::new(AnyP))], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if let Lisp::List(id) = args[0] {
+                 match ctx.lists.get_nth(id, 0) {
+                     Some(head) => Ok(head),
+                     None => Err(LispError::OutOfBounds(0, Lisp::List(id)))
+                 }
+             } else { panic!("{}", ARG_CHECKER_MSG) }
+            ),
+            (&"tail", true, ArgSpec{types: vec![ListP(Box::new(AnyP))], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if let Lisp::List(id) = args[0] {
+                 let vec = ctx.lists.get_vec(id);
+                 if vec.len() == 0 {
+                     Err(LispError::OutOfBounds(0, Lisp::List(id)))
+                 } else {
+                     Ok(ctx.lists.store(vec[1..].to_vec()))
+                 }
+             } else { panic!("{}", ARG_CHECKER_MSG) }
             ),
             (&"nth", true, ArgSpec{types: vec![ListP(Box::new(AnyP)), NumP], extend: false},
              &|ctx: &mut LispContext, args: &[Lisp]|
@@ -883,28 +960,10 @@ pub mod lisp_callables {
                  Ok(Lisp::Num(ctx.lists.get_length(id) as f64))
              } else { panic!("{}", ARG_CHECKER_MSG) }
             ),
-            (&"if", false, ArgSpec{types: vec![AnyP, AnyP, AnyP], extend: true},
+
+            (&"=", true, ArgSpec{types: vec![AnyP, AnyP], extend: true},
              &|ctx: &mut LispContext, args: &[Lisp]|
-             if evaluate_expression(ctx, args[0].clone()) ? == ctx.symbols.nil_sym() {
-                 let sequence = sequence_expressions(ctx, &args[2..]);
-                 evaluate_expression(ctx, sequence)
-             } else {
-                 evaluate_expression(ctx, args[1].clone())
-             }
-            ),
-            (&"while", false, ArgSpec{types: vec![ListP(Box::new(AnyP)), NumP], extend: false},
-             &|ctx: &mut LispContext, args: &[Lisp]| {
-                 while evaluate_expression(ctx, args[0].clone()) ? != ctx.symbols.intern("nil") {
-                     for a in &args[1..] {
-                         evaluate_expression(ctx, a.clone()) ?;
-                     }
-                 }
-                 Ok(ctx.symbols.intern("nil"))
-             }
-            ),
-            (&"not", true, ArgSpec{types: vec![AnyP], extend: false},
-             &|ctx: &mut LispContext, args: &[Lisp]|
-             if args[0] == ctx.symbols.nil_sym() {
+             if args[1..].iter().all(|e| *e == args[0]) {
                  Ok(ctx.symbols.true_sym())
              } else {
                  Ok(ctx.symbols.nil_sym())
@@ -935,14 +994,6 @@ pub mod lisp_callables {
                  Ok(Lisp::Num(total))
 
              } else { panic!("{}", ARG_CHECKER_MSG); }
-            ),
-            (&"=", true, ArgSpec{types: vec![AnyP, AnyP], extend: true},
-             &|ctx: &mut LispContext, args: &[Lisp]|
-             if args[1..].iter().all(|e| *e == args[0]) {
-                 Ok(ctx.symbols.true_sym())
-             } else {
-                 Ok(ctx.symbols.nil_sym())
-             }
             ),
         ]
     }
