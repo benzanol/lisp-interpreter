@@ -1,6 +1,7 @@
 pub mod lisp_objects {
     use std::sync::Mutex;
-    use crate::lisp_global::*;
+    use crate::lisp_global::LispContext;
+    use crate::lisp_callables;
 
     /// Note that since lists and symbols only store a reference, the
     /// id of the associated object in a list/symbol table, cloning the
@@ -21,24 +22,33 @@ pub mod lisp_objects {
         Func(usize),
 
         String(String),
-        Error(String),
     }
 
-    impl Lisp {
+    // type LispError = String;
+    #[derive(Debug)]
+    pub enum LispError {
+        EvalEmptyList,
+        UnboundSymbol(Lisp),
+        NotCallable(Lisp),
+        InvalidArguments(lisp_callables::ArgError),
+        OutOfBounds(usize, Lisp),
+    }
 
+    pub type LispResult = Result<Lisp, LispError>;
+
+
+    impl Lisp {
         pub fn print(&self, ctx: &LispContext) -> String {
             match self {
                 Lisp::Num(n) => format!("{}", n),
-                Lisp::Symbol(id) => ctx.symbols.get_symbol_name(*id).unwrap(),
+                Lisp::Symbol(id) => ctx.symbols.get_symbol_name(*id),
                 Lisp::Func(id) => format!("<callable:{}>", id),
                 Lisp::String(text) => format!("\"{}\"", text),
-                Lisp::Error(text) => format!("\"{}\"", text),
                 Lisp::List(id) =>
                     format!(
                         "({})",
                         ctx.lists
-                            .get_list_clone(*id)
-                            .unwrap()
+                            .get_vec(*id)
                             .iter()
                             .map(|e| e.print(ctx))
                             .collect::<Vec<String>>()
@@ -62,19 +72,30 @@ pub mod lisp_global {
     use std::collections::hash_map::Entry;
     use std::sync::Mutex;
     use std::fmt;
-    use crate::lisp_objects::*;
+    use crate::lisp_objects::{Lisp, LispSymbol};
+    use crate::lisp_callables::LispCallable;
 
     pub struct LispContext {
         pub symbols: SymbolTable,
-        pub lists: ListTable
+        pub lists: ListTable,
+        pub callables: Vec<LispCallable>,
     }
 
     impl LispContext {
         pub fn new() -> Self {
-            LispContext{
+            let mut ctx = LispContext{
                 symbols: SymbolTable::new(),
                 lists: ListTable::new(),
+                callables: crate::lisp_callables::get_callables()
+            };
+
+            // Put all of the callables into the symbol table
+            for (idx, (name, _, _, _)) in ctx.callables.iter().enumerate() {
+                let symbol = ctx.symbols.intern(name);
+                ctx.symbols.set(symbol, Lisp::Func(idx));
             }
+
+            ctx
         }
     }
 
@@ -96,13 +117,13 @@ pub mod lisp_global {
         pub fn new() -> SymbolTable {
             let mut st = SymbolTable{symbols: Vec::new(), ids: HashMap::new()};
 
+            // Make nil and true self referencing symbols
             let nil_symbol = st.intern("nil");
             st.set(nil_symbol.clone(), nil_symbol);
 
-            let t_symbol = st.intern("t");
-            st.set(t_symbol.clone(), t_symbol);
+            let true_symbol = st.intern("true");
+            st.set(true_symbol.clone(), true_symbol);
 
-            crate::lisp_callables::declare_callables(&mut st);
             st
         }
 
@@ -134,8 +155,8 @@ pub mod lisp_global {
 
 
         // Given a symbol id, return an optional string of its name
-        pub fn get_symbol_name(&self, id: usize) -> Option<String> {
-            self.symbols.get(id).map(|s| s.name.clone())
+        pub fn get_symbol_name(&self, id: usize) -> String {
+            self.symbols.get(id).map(|s| s.name.clone()).unwrap()
         }
 
 
@@ -171,6 +192,11 @@ pub mod lisp_global {
                 panic!("Can't get value of non-symbol")
             }
         }
+
+
+        pub fn nil_sym  (&mut self) -> Lisp { self.intern("nil") }
+        pub fn true_sym (&mut self) -> Lisp { self.intern("true") }
+        pub fn quote_sym(&mut self) -> Lisp { self.intern("quote") }
     }
 
     impl fmt::Display for SymbolTable {
@@ -195,13 +221,14 @@ pub mod lisp_global {
             ListTable{lists: HashMap::new(), next: 0}
         }
 
+
         // Given a vec, add it to the global storage, and then return a reference
-        pub fn store(&mut self, list: Vec<Lisp>) -> Lisp {
-            Lisp::List(self.get_list_id(list))
+        pub fn store(&mut self, vec: Vec<Lisp>) -> Lisp {
+            Lisp::List(self.store_and_get_id(vec))
         }
 
         // Given a vec, add it to the global storage, and then return its id
-        fn get_list_id(&mut self, list: Vec<Lisp>) -> usize {
+        fn store_and_get_id(&mut self, list: Vec<Lisp>) -> usize {
             let id = self.next;
             self.lists.insert(id, list);
             self.next += 1;
@@ -210,17 +237,24 @@ pub mod lisp_global {
 
 
         // Given a list id, return a clone of the vector
-        pub fn get_list_clone(&self, id: usize) -> Option<Vec<Lisp>> {
-            self.lists.get(&id).map(|r| r.clone())
+        pub fn get_vec(&self, id: usize) -> Vec<Lisp> {
+            self.lists.get(&id).map(|r| r.clone()).unwrap()
         }
 
-        pub fn get_list_length(&self, id: usize) -> Option<usize> {
-            self.lists.get(&id).map(|l| l.len())
+        pub fn get_length(&self, id: usize) -> usize {
+            self.lists.get(&id).map(|l| l.len()).unwrap()
         }
 
-        // Given a list id and index, return the element at that index
-        pub fn get_list_element(&self, list: usize, element: usize) -> Option<Lisp> {
-            self.lists.get(&list).map(|l| l.get(element).map(|e| e.clone())).flatten()
+        /// Given a list id and index, return the element at that index
+        ///
+        /// The option is for whether the index exits; If the list
+        /// does not exist the function will panic
+        pub fn get_nth(&self, list: usize, index: usize) -> Option<Lisp> {
+            self.lists
+                .get(&list)
+                .unwrap()
+                .get(index)
+                .map(|e| e.clone())
         }
     }
 
@@ -238,7 +272,7 @@ pub mod lisp_global {
     type RefTracker = HashMap<usize, bool>;
 
     pub fn garbage_collect(ctx: &mut LispContext) {
-        let LispContext{lists: list_table, symbols: symbol_table} = ctx;
+        let LispContext{lists: list_table, symbols: symbol_table, callables: _} = ctx;
         let mut ref_tracker: RefTracker =
             list_table.lists.iter().map(|(n, _)| (*n, false)).collect();
 
@@ -329,7 +363,7 @@ pub mod lisp_parse{
             }
             Some('\'') => {
                 let (expr, rest) = parse_expr(&code[1..], ctx) ?;
-                let quote_sym = ctx.symbols.intern("quote");
+                let quote_sym = ctx.symbols.quote_sym();
                 Ok((ctx.lists.store(vec![quote_sym, expr]), rest))
             }
             Some('"') => parse_string(code),
@@ -424,98 +458,81 @@ pub mod lisp_parse{
 }
 
 pub mod lisp_evaluation {
-    use crate::lisp_objects::*;
+    use crate::lisp_objects::{Lisp, LispResult, LispError};
     use crate::lisp_global::*;
     use crate::lisp_callables::*;
 
-    pub fn evaluate_expression(ctx: &mut LispContext, expr: Lisp) -> Lisp {
+    pub fn evaluate_expression(ctx: &mut LispContext, expr: Lisp) -> LispResult {
         match expr {
             // If it is a symbol, get its value
             Lisp::Symbol(id) => ctx.symbols
                 .get(expr)
-                .or(Some(Lisp::Error(
-                    format!("Symbol `{}` is not defined.",
-                            ctx.symbols.get_symbol_name(id).unwrap()
-                    )
-                )))
-                .unwrap(),
+                .ok_or(LispError::UnboundSymbol(Lisp::Symbol(id))),
 
             // If it is a list, pass the arguments to call_expression
             Lisp::List(id) => {
                 // Access the physical values inside the list
-                let elems = ctx.lists
-                    .get_list_clone(id)
-                    .expect("Tried to access dropped list in `eval`.");
+                let elems = ctx.lists.get_vec(id);
 
                 match elems.split_first() {
-                    None => Lisp::Error("Cannot evaluate empty list.".to_owned()),
+                    None => Err(LispError::EvalEmptyList),
                     Some((f, args)) => call_expression(ctx, f.clone(), args)
                 }
             }
 
             // All other expressions are self evaluating
-            expression => expression
+            expression => Ok(expression)
         }
     }
 
-    pub fn call_expression(ctx: &mut LispContext, callable: Lisp, args: &[Lisp]) -> Lisp {
-        let callable_value = evaluate_expression(ctx, callable);
+    pub fn call_expression(ctx: &mut LispContext, callable: Lisp, args: &[Lisp]) -> LispResult {
+        let callable_value = evaluate_expression(ctx, callable) ?;
         match &callable_value {
-            Lisp::Error(_) => callable_value,
-
-            Lisp::Num(_) => Lisp::Error("Cannot call number.".to_owned()),
-            Lisp::String(_) => Lisp::Error("Cannot call string.".to_owned()),
-            Lisp::Symbol(_) => Lisp::Error("Cannot call symbol.".to_owned()),
+            Lisp::Num(_) => Err(LispError::NotCallable(callable_value)),
+            Lisp::String(_) => Err(LispError::NotCallable(callable_value)),
+            Lisp::Symbol(_) => Err(LispError::NotCallable(callable_value)),
 
             Lisp::List(lambda_id) => {
-                let lambda_vec = ctx.lists.get_list_clone(*lambda_id).unwrap();
+                let lambda_vec = ctx.lists.get_vec(*lambda_id);
 
+                // Lambda expression must have atleast 2 arguments
                 if lambda_vec.len() < 2 {
-                    return Lisp::Error(format!(
-                        "Lambda expression must have atleast 2 elements, found {}.",
-                        callable_value.print(ctx)
-                    ));
+                    return Err(LispError::NotCallable(Lisp::List(*lambda_id)));
                 }
 
-                let args =
+                // Get arguments based on whether the first symbol is
+                // lambda, Lambda, or something else (error)
+                let args = {
                     if lambda_vec[0] == ctx.symbols.intern("lambda") {
-                        match evaluate_arguments(ctx, args) {
-                            Ok(arg_vec) => arg_vec,
-                            Err(msg) => { return Lisp::Error(msg); }
-                        }
+                        evaluate_arguments(ctx, args) ?
                     } else if lambda_vec[0] == ctx.symbols.intern("Lambda") {
                         Vec::from(args)
                     } else {
-                        return Lisp::Error(format!(
-                            "Expected function, found {}.",
-                            callable_value.print(ctx)
-                        ));
-                    };
+                        return Err(LispError::NotCallable(Lisp::List(*lambda_id)));
+                    }};
 
                 // Make sure the second item in the list is a list (of arg names)
                 if let Lisp::List(args_id) = lambda_vec[1] {
-                    let arg_vars = ctx.lists.get_list_clone(args_id).unwrap();
+                    let arg_vars = ctx.lists.get_vec(args_id);
 
                     // Make sure the number of arguments is correct
-                    if arg_vars.len() != args.len() {
-                        return Lisp::Error(format!(
-                            "Expected {} arguments, but found {}.",
-                            arg_vars.len(), args.len()
+                    if args.len() < arg_vars.len() {
+                        return Err(LispError::InvalidArguments(
+                            ArgError::TooShort{found: args.len() as u8, min: arg_vars.len() as u8}
+                        ));
+                    } else if args.len() > arg_vars.len() {
+                        return Err(LispError::InvalidArguments(
+                            ArgError::TooLong{found: args.len() as u8, max: arg_vars.len() as u8}
                         ));
                     }
 
                     // Pair arguments with corresponding variables
-                    let mut bindings: Vec<(usize, Lisp)> = Vec::with_capacity(args.len());
-                    for i in 0..args.len() {
-                        if let Lisp::Symbol(id) = arg_vars[i] {
-                            bindings.push((id, args[i].clone()));
-                        } else {
-                            return Lisp::Error(format!(
-                                "Lambda expression arguments must be symbols, found `{}`.",
-                                arg_vars[i].print(ctx)
-                            ));
-                        }
-                    }
+                    let bindings: Vec<(usize, Lisp)> =
+                        arg_vars.iter().zip(args)
+                        .map(|(var, arg)| match var {
+                            Lisp::Symbol(id) => Ok((*id, arg.clone())),
+                            _                => Err(LispError::NotCallable(callable_value.clone()))
+                        }).collect::<Result<Vec<(usize, Lisp)>, LispError>>() ?;
 
                     // The expression is the remainder of the lambda expression
                     let expr_vec = [&[ctx.symbols.intern("progn")], &lambda_vec[2..]].concat();
@@ -525,32 +542,31 @@ pub mod lisp_evaluation {
                     evaluate_with(ctx, expr, bindings)
                         
                 } else {
-                    return Lisp::Error("Second item of lambda expression must be a list.".to_owned());
+                    Err(LispError::NotCallable(callable_value))
                 }
             }
 
             Lisp::Func(id) => {
-                let tup = LISP_CALLABLES.get(*id)
-                    .expect("Tried to access builtin callable which doesn't exist.");
+                let arg_spec = ctx.callables[*id].2.clone();
+                let eval_args = ctx.callables[*id].1;
 
-                if !tup.3.satisfies(args.len() as u16) {
-                    Lisp::Error(format!(
-                        "Called `{}` with {} argument{}, but it requires {}.",
-                        tup.0, args.len(), if args.len() == 1 {""} else {"s"}, tup.3
-                    ))
-                } else if tup.2 {
-                    match evaluate_arguments(ctx, args) {
-                        Ok(evaled_args) => tup.1(ctx, &evaled_args),
-                        Err(msg) => Lisp::Error(msg)
-                    }
+                // Maybe evaluate the arguments, only if the second
+                // field of the callable is true
+                let evaled_args = if eval_args {
+                    evaluate_arguments(ctx, args) ?
+                } else { args.to_vec() };
+
+                // Return error if the arguments are invalid
+                if let Err(arg_error) = arg_spec.satisfies(ctx, &evaled_args) {
+                    Err(LispError::InvalidArguments(arg_error))
                 } else {
-                    tup.1(ctx, args)
+                    ctx.callables[*id].3(ctx, &evaled_args)
                 }
             }
         }
     }
 
-    pub fn evaluate_with(ctx: &mut LispContext, expr: Lisp, binds: Vec<(usize, Lisp)>) -> Lisp {
+    pub fn evaluate_with(ctx: &mut LispContext, expr: Lisp, binds: Vec<(usize, Lisp)>) -> LispResult {
         // Set the new values in the context, and keep track of the
         // original values in a vector
         let mut originals: Vec<(usize, Option<Lisp>)> = Vec::with_capacity(binds.len());
@@ -590,292 +606,319 @@ pub mod lisp_evaluation {
         output
     }
 
-    fn evaluate_arguments(ctx: &mut LispContext, args: &[Lisp]) -> Result<Vec<Lisp>, String> {
+    pub fn sequence_expressions(ctx: &mut LispContext, exprs: &[Lisp]) -> Lisp {
+        // Create a single progn expression containing exprs
+        let expr_vec = [&[ctx.symbols.intern("progn")], exprs].concat();
+        ctx.lists.store(expr_vec)
+    }
+
+    fn evaluate_arguments(ctx: &mut LispContext, args: &[Lisp]) -> Result<Vec<Lisp>, LispError> {
         // Evaluate each argument and add it to a vector
-        let mut evaled_args = Vec::with_capacity(args.len());
+        let mut evaled_args: Vec<Lisp> = Vec::with_capacity(args.len());
 
         // Can't use map, because this wouldn't allow
         // returning an error as soon as it is reached
         for e in args {
-            let output = evaluate_expression(ctx, e.clone());
-
             // If the argument evaluates to an error, the whole
             // expression evaluates to an error, so return on the spot
-            if let Lisp::Error(s) = output {
-                return Err(s);
-            } else {
-                evaled_args.push(output);
-            }
+            evaled_args.push(evaluate_expression(ctx, e.clone()) ?);
         }
         Ok(evaled_args)
     }
 }
 
 pub mod lisp_callables {
-    use std::fmt;
     use crate::lisp_objects::*;
     use crate::lisp_global::*;
     use crate::lisp_evaluation::*;
-    use ArgRange::*;
     
 
-    pub enum ArgRange {
-        Exactly(u16),
-        Atleast(u16),
-        Between(u16, u16),
+    #[derive(Clone, Debug)]
+    pub enum LispType {
+        AnyP,
+        NumP,
+        StringP,
+        SymbolP,
+        ListP(Box<LispType>),
+        TupleP(Vec<LispType>),
     }
 
-    impl ArgRange {
-        pub fn satisfies(&self, count: u16) -> bool {
-            match self {
-                Exactly(n) => count == *n,
-                Atleast(min) => count >= *min,
-                Between(min, max) => count >= *min && count <= *max
-            }
-        }
-    }
+    impl LispType {
+        pub fn satisfies(&self, ctx: &mut LispContext, obj: &Lisp) -> Result<(), TypeError> {
+            use LispType::*;
+            let matches = match self {
+                AnyP     => true,
+                NumP     => matches!(obj, Lisp::Num(_)),
+                StringP  => matches!(obj, Lisp::String(_)),
+                SymbolP  => matches!(obj, Lisp::Symbol(_)),
+                ListP(b) =>
+                    if let Lisp::List(id) = obj {
+                        ctx.lists.get_vec(*id).iter()
+                            .all(|e| b.satisfies(ctx, e).is_ok())
+                    } else { false }
 
-    impl fmt::Display for ArgRange {
-        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            match self {
-                Exactly(n) => write!(f, "{}", n),
-                Atleast(n) => write!(f, "atleast {}", n),
-                Between(min, max) => write!(f, "{}-{}", min, max),
-            }
-        }
-    }
+                TupleP(type_vec) =>
+                    if let Lisp::List(id) = obj {
+                        let obj_vec = ctx.lists.get_vec(*id);
+                        type_vec.len() == obj_vec.len() && {
+                            type_vec.iter().zip(obj_vec)
+                                .all(|(t, o)| t.satisfies(ctx, &o).is_ok())
+                        }
+                    } else { false }
+            };
 
-
-    pub type LispCallable = dyn Fn(&mut LispContext, &[Lisp]) -> Lisp;
-
-    /// The function name, implementation, and whether to evaluate the
-    /// arguments before passing them to the function
-    pub const LISP_CALLABLES: [(&str, &LispCallable, bool, ArgRange) ; 19] = [
-        (&"eval", &lisp_eval, true, Exactly(1)),
-        (&"call", &lisp_call, true, Atleast(1)),
-        (&"quote", &lisp_quote, false, Exactly(1)),
-        (&"progn", &lisp_progn, true, Atleast(1)),
-        (&"lambda", &lisp_lambda, false, Atleast(0)),
-        (&"set", &lisp_set, true, Exactly(2)),
-        (&"setq", &lisp_setq, false, Exactly(2)),
-        (&"let", &lisp_let, false, Atleast(2)),
-        (&"fn", &lisp_fn, false, Atleast(3)),
-        (&"print", &lisp_print, true, Exactly(1)),
-        (&"list", &lisp_list, true, Atleast(0)),
-        (&"nth", &lisp_nth, true, Exactly(2)),
-        (&"len", &lisp_len, true, Exactly(1)),
-        (&"if", &lisp_if, false, Atleast(3)),
-        (&"while", &lisp_while, false, Atleast(1)),
-        (&"not", &lisp_not, true, Exactly(1)),
-        (&"=", &lisp_eq, true, Atleast(0)),
-        (&"+", &lisp_plus, true, Atleast(0)),
-        (&"-", &lisp_minus, true, Atleast(0)),
-    ];
-
-    pub fn declare_callables(st: &mut SymbolTable) {
-        for (idx, (name, _, _, _)) in LISP_CALLABLES.iter().enumerate() {
-            let symbol = st.intern(name);
-            st.set(symbol, Lisp::Func(idx));
-        }
-    }
-
-
-    fn lisp_eval(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        evaluate_expression(ctx, args[0].clone())
-    }
-
-    fn lisp_call(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        call_expression(ctx, args[0].clone(), &args[1..])
-    }
-
-    fn lisp_quote(_: &mut LispContext, args: &[Lisp]) -> Lisp {
-        if args.len() == 1 {
-            args[0].clone()
-        } else {
-            Lisp::Error("Quote requires 1 argument".to_owned())
-        }
-    }
-
-    fn lisp_progn(_: &mut LispContext, args: &[Lisp]) -> Lisp {
-        args.last().unwrap().clone()
-    }
-
-    fn lisp_lambda(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        ctx.lists.store([&[ctx.symbols.intern("lambda")], args].concat())
-    }
-
-    fn lisp_set(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        if let &[Lisp::Symbol(sym), value] = &args {
-            ctx.symbols.set(Lisp::Symbol(*sym), value.clone());
-            Lisp::Symbol(*sym)
-        } else {
-            Lisp::Error(format!("Can only set a symbol, not `{}`", args[0].print(ctx)))
-        }
-    }
-
-    fn lisp_setq(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        let expr = evaluate_expression(ctx, args[1].clone());
-        lisp_set(ctx, &[args[0].clone(), expr])
-    }
-
-    fn lisp_let(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        let bind_form = args[0].clone();
-        let bind_vec = if let Lisp::List(id) = bind_form {
-            ctx.lists.get_list_clone(id).unwrap()
-        } else {
-            return Lisp::Error(String::from(
-                "First element of `let` expression must be a list of variable bindings."
-            ));
-        };
-
-        if bind_vec.len() % 2 != 0 {
-            return Lisp::Error(String::from(
-                "Bind form must have an even number of elements."
-            ));
-        }
-
-        let mut bindings: Vec<(usize, Lisp)> = Vec::with_capacity(bind_vec.len() / 2);
-        for chunk in bind_vec.chunks(2) {
-            if let Lisp::Symbol(id) = chunk[0] {
-                bindings.push((id, chunk[1].clone()));
+            if matches {
+                Ok(())
             } else {
-                return Lisp::Error("Can't assign binding to non-symbol.".to_owned())
+                Err(TypeError(self.clone(), obj.clone()))
             }
         }
-
-        let expr_vec = [&[ctx.symbols.intern("progn")], &args[1..]].concat();
-        let expr = ctx.lists.store(expr_vec);
-
-        evaluate_with(ctx, expr, bindings)
     }
 
-    fn lisp_fn(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        if let Lisp::Symbol(name_id) = args[0] {
-            if let Lisp::List(args_id) = args[1] {
-                let arg_vec = ctx.lists.get_list_clone(args_id).unwrap();
-                // If all elements in the list are symbols
-                if arg_vec.iter().all(|a| if let Lisp::Symbol(_) = a {true} else {false}) {
-                    let lambda_vec = [&[ctx.symbols.intern("lambda")], &args[1..]].concat();
-                    let lambda_expr = ctx.lists.store(lambda_vec);
-                    ctx.symbols.set(Lisp::Symbol(name_id), lambda_expr);
-                    Lisp::Symbol(name_id)
-                } else {
-                    Lisp::Error("Second argument of `fn` must be a list of symbols.".to_owned())
-                }
+    #[derive(Debug)]
+    pub struct TypeError(LispType, Lisp);
+
+
+    #[derive(Clone)]
+    pub struct ArgSpec{
+        types: Vec<LispType>,
+        extend: bool
+    }
+
+    #[derive(Debug)]
+    pub enum ArgError {
+        TooLong{found: u8, max: u8},
+        TooShort{found: u8, min: u8},
+        Type{idx: u8, error: TypeError},
+    }
+
+    impl ArgSpec {
+        pub fn satisfies(&self, ctx: &mut LispContext, args: &[Lisp]) -> Result<(), ArgError> {
+            let ArgSpec{types, extend} = self;
+
+            if args.len() < types.len() {
+                Err(ArgError::TooShort{found: args.len() as u8, min: types.len() as u8})
+
+            } else if !extend && args.len() > types.len() {
+                Err(ArgError::TooLong{found: args.len() as u8, max: types.len() as u8})
+
             } else {
-                Lisp::Error("Second argument of `fn` must be a list of symbols.".to_owned())
-            }
-        } else {
-            Lisp::Error("First argument of `fn` must be a symbol.".to_owned())
-        }
-    }
+                // Make sure the argument types match the required types
 
-    fn lisp_print(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        println!("> {}", args[0].print(ctx));
-        ctx.symbols.intern("nil")
-    }
+                // Get the last type to repeat, or if there are no
+                // types at all, simply return ok
+                let last_type = match types.iter().last() {
+                    Some(last) => last,
+                    None => { return Ok(()) }
+                };
 
-    fn lisp_list(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        ctx.lists.store(Vec::from(args))
-    }
+                // Get the first type error, if there is one
+                let first_type_error = types.iter()
+                    .chain(std::iter::repeat(last_type)) // Repeat the last type for all remaining args
+                    .zip(args).enumerate()
+                    .find_map(
+                        |(idx, (typ, arg))|
+                        match typ.satisfies(ctx, arg) {
+                            Ok(_) => None,
+                            Err(error) => Some((idx, error))
+                        });
 
-    fn lisp_nth(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        if let Lisp::List(id) = args[0] {
-            if let Lisp::Num(float) = args[1] {
-                let n = float as usize;
-                let len = ctx.lists.get_list_length(id).unwrap();
-                if n < len {
-                    ctx.lists.get_list_element(id, n as usize).unwrap()
-                } else {
-                    Lisp::Error(format!("Index {} out of bounds for length {}", n, len))
-                }
-            } else {
-                Lisp::Error(format!("Expected number, found {}", args[1].print(ctx)))
-            }
-        } else {
-            Lisp::Error(format!("Expected list, found {}", args[0].print(ctx)))
-        }
-    }
-
-    fn lisp_len(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        if let Lisp::List(id) = args[0] {
-            Lisp::Num(ctx.lists.get_list_length(id).unwrap() as f64)
-        } else {
-            Lisp::Error(format!("Expected list, found {}", args[0].print(ctx)))
-        }
-    }
-    
-    fn lisp_if(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        if evaluate_expression(ctx, args[0].clone()) == ctx.symbols.intern("nil") {
-            evaluate_expression(ctx, args[2].clone())
-        } else {
-            evaluate_expression(ctx, args[1].clone())
-        }
-    }
-
-    fn lisp_while(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        while evaluate_expression(ctx, args[0].clone()) != ctx.symbols.intern("nil") {
-            for a in &args[1..] {
-                evaluate_expression(ctx, a.clone());
-            }
-        }
-        ctx.symbols.intern("nil")
-    }
-
-    fn lisp_not(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        if args[0] == ctx.symbols.intern("nil") {
-            ctx.symbols.intern("t")
-        } else {
-            ctx.symbols.intern("nil")
-        }
-    }
-
-    fn lisp_plus(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        let mut sum = 0.0;
-        for a in args {
-            if let Lisp::Num(n) = a {
-                sum += n;
-            } else {
-                return Lisp::Error(format!("Function `+` expected number, found `{}`", a.print(ctx)));
-            }
-        }
-        Lisp::Num(sum)
-    }
-
-    fn lisp_minus(_: &mut LispContext, args: &[Lisp]) -> Lisp {
-        if args.len() == 0 {
-            Lisp::Num(0.0)
-
-        } else if let &[Lisp::Num(n)] = args {
-            Lisp::Num(-n)
-
-        } else if let Lisp::Num(mut total) = args[0] {
-            for a in &args[1..] {
-                if let Lisp::Num(n) = a {
-                    total -= n;
-                } else {
-                    return Lisp::Error("Function `-` must be called with numbers.".to_owned());
+                // Return an arg error if there was a type error
+                match first_type_error {
+                    None => Ok(()),
+                    Some((idx, type_error)) =>
+                        Err(ArgError::Type{
+                            idx: idx as u8,
+                            error: type_error
+                        })
                 }
             }
-            Lisp::Num(total)
-
-        } else {
-            return Lisp::Error("Function `-` must be called with numbers.".to_owned())
         }
     }
 
-    fn lisp_eq(ctx: &mut LispContext, args: &[Lisp]) -> Lisp {
-        if args.len() == 0 {
-            return ctx.symbols.intern("t");
-        }
 
-        for a in &args[1..] {
-            if *a != args[0] {
-                return ctx.symbols.intern("nil");
-            }
-        }
-        ctx.symbols.intern("t")
+    pub type LispFunc = dyn Fn(&mut LispContext, &[Lisp]) -> LispResult;
+
+    pub type LispCallable = (&'static str, bool, ArgSpec, &'static LispFunc);
+
+
+    pub fn get_callables() -> Vec<LispCallable> {
+        vec![
+            (&"eval", true, ArgSpec{types: vec![AnyP], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             evaluate_expression(ctx, args[0].clone())
+            ),
+            (&"call", true, ArgSpec{types: vec![AnyP], extend: true},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             call_expression(ctx, args[0].clone(), &args[1..])
+            ),
+            (&"quote", false, ArgSpec{types: vec![AnyP], extend: false},
+             &|_: &mut LispContext, args: &[Lisp]|
+             Ok(args[0].clone())
+            ),
+            (&"progn", true, ArgSpec{types: vec![AnyP], extend: true},
+             &|_: &mut LispContext, args: &[Lisp]|
+             Ok(args.last().unwrap().clone())
+            ),
+            (&"lambda", false, ArgSpec{types: vec![], extend: true},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             Ok(ctx.lists.store([&[ctx.symbols.intern("lambda")], args].concat()))
+            ),
+            (&"set", true, ArgSpec{types: vec![SymbolP, AnyP], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if let &[Lisp::Symbol(sym), value] = &args {
+                 ctx.symbols.set(Lisp::Symbol(*sym), value.clone());
+                 Ok(Lisp::Symbol(*sym))
+             } else { panic!("{}", ARG_CHECKER_MSG) }
+            ),
+            (&"setq", false, ArgSpec{types: vec![SymbolP, AnyP], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]| {
+                 if let Lisp::Symbol(sym) = args[0] {
+                     let value = evaluate_expression(ctx, args[1].clone()) ?;
+                     ctx.symbols.set(Lisp::Symbol(sym), value.clone());
+                     Ok(Lisp::Symbol(sym))
+                 } else { panic!("{}", ARG_CHECKER_MSG) }
+             }
+            ),
+            (&"let", false, ArgSpec{
+                // Has the form (let ((SYMBOL ANY) ...) ANY...)
+                types: vec![ListP(Box::new(TupleP(vec![SymbolP, AnyP]))), AnyP],
+                extend: true
+            },
+             &|ctx: &mut LispContext, args: &[Lisp]| {
+                 let bind_vec = if let Lisp::List(id) = args[0] {
+                     ctx.lists.get_vec(id)
+                 } else { panic!("{}", ARG_CHECKER_MSG) };
+
+                 // Destructure the lisp list into a vector of bindings
+                 let bindings: Vec<(usize, Lisp)> =
+                     bind_vec.iter().map(
+                         |binding|
+                         if let Lisp::List(id) = binding {
+                             if let [Lisp::Symbol(sym), value] = &ctx.lists.get_vec(*id)[..] {
+                                 (*sym, value.clone())
+
+                             } else { panic!("{}", ARG_CHECKER_MSG) }
+                         } else { panic!("{}", ARG_CHECKER_MSG) }
+                     ).collect();
+                 
+                 let expr = sequence_expressions(ctx, &args[1..]);
+                 evaluate_with(ctx, expr, bindings)
+             }
+            ),
+            (&"fn", false, ArgSpec{types: vec![ListP(Box::new(SymbolP)), AnyP], extend: true},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if let Lisp::Symbol(name_id) = args[0] {
+                 // Create the vector representing the lambda expression
+                 // of the function, and store it as a lisp list
+                 let lambda_vec = [&[ctx.symbols.intern("lambda")], &args[1..]].concat();
+                 let lambda_expr = ctx.lists.store(lambda_vec);
+
+                 // Assign the function name to the lambda expression
+                 ctx.symbols.set(Lisp::Symbol(name_id), lambda_expr);
+
+                 // Return the function name
+                 Ok(Lisp::Symbol(name_id))
+             } else { panic!("{}", ARG_CHECKER_MSG) }
+            ),
+            (&"print", true, ArgSpec{types: vec![AnyP], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]| {
+                 println!("> {}", args[0].print(ctx));
+                 Ok(ctx.symbols.nil_sym())
+             }
+            ),
+            (&"list", true, ArgSpec{types: vec![], extend: true},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             Ok(ctx.lists.store(Vec::from(args)))
+            ),
+            (&"nth", true, ArgSpec{types: vec![ListP(Box::new(AnyP)), NumP], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if let Lisp::List(id) = args[0] {
+                 if let Lisp::Num(float) = args[1] {
+                     let idx = float as usize;
+
+                     // Return out of bounds if the index isn't in the list
+                     ctx.lists.get_nth(id, idx)
+                         .ok_or(LispError::OutOfBounds(idx, args[0].clone()))
+
+                 } else { panic!("{}", ARG_CHECKER_MSG) }
+             } else { panic!("{}", ARG_CHECKER_MSG) }
+            ),
+            (&"len", true, ArgSpec{types: vec![ListP(Box::new(AnyP))], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if let Lisp::List(id) = args[0] {
+                 Ok(Lisp::Num(ctx.lists.get_length(id) as f64))
+             } else { panic!("{}", ARG_CHECKER_MSG) }
+            ),
+            (&"if", false, ArgSpec{types: vec![AnyP, AnyP, AnyP], extend: true},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if evaluate_expression(ctx, args[0].clone()) ? == ctx.symbols.nil_sym() {
+                 let sequence = sequence_expressions(ctx, &args[2..]);
+                 evaluate_expression(ctx, sequence)
+             } else {
+                 evaluate_expression(ctx, args[1].clone())
+             }
+            ),
+            (&"while", false, ArgSpec{types: vec![ListP(Box::new(AnyP)), NumP], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]| {
+                 while evaluate_expression(ctx, args[0].clone()) ? != ctx.symbols.intern("nil") {
+                     for a in &args[1..] {
+                         evaluate_expression(ctx, a.clone()) ?;
+                     }
+                 }
+                 Ok(ctx.symbols.intern("nil"))
+             }
+            ),
+            (&"not", true, ArgSpec{types: vec![AnyP], extend: false},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if args[0] == ctx.symbols.nil_sym() {
+                 Ok(ctx.symbols.true_sym())
+             } else {
+                 Ok(ctx.symbols.nil_sym())
+             }
+            ),
+            (&"+", true, ArgSpec{types: vec![NumP], extend: true},
+             &|_: &mut LispContext, args: &[Lisp]|
+             Ok(Lisp::Num(
+                 args.iter().map(|e| match e {
+                     Lisp::Num(n) => *n,
+                     _ => panic!("{}", ARG_CHECKER_MSG)
+                 }).sum::<f64>()
+             ))
+            ),
+            (&"-", true, ArgSpec{types: vec![NumP], extend: true},
+             &|_: &mut LispContext, args: &[Lisp]|
+             if let &[Lisp::Num(n)] = args {
+                 // If its a single number, negate it
+                 Ok(Lisp::Num(-n))
+
+             } else if let Lisp::Num(mut total) = args[0] {
+                 // If there are multiple numbers, subtract the remaining
+                 // from the first
+                 for a in &args[1..] { match a {
+                     Lisp::Num(n) => { total -= n; }
+                     _ => { panic!("{}", ARG_CHECKER_MSG); }
+                 }}
+                 Ok(Lisp::Num(total))
+
+             } else { panic!("{}", ARG_CHECKER_MSG); }
+            ),
+            (&"=", true, ArgSpec{types: vec![AnyP, AnyP], extend: true},
+             &|ctx: &mut LispContext, args: &[Lisp]|
+             if args[1..].iter().all(|e| *e == args[0]) {
+                 Ok(ctx.symbols.true_sym())
+             } else {
+                 Ok(ctx.symbols.nil_sym())
+             }
+            ),
+        ]
     }
+
+    // The function name, implementation, and whether to evaluate the
+    // arguments before passing them to the function
+    use LispType::*;
+
+    const ARG_CHECKER_MSG: &str = "Arg checker failed to prevent invalid state.";
 }
 
 
@@ -888,7 +931,6 @@ fn main() {
     use crate::lisp_evaluation::*;
 
     let mut ctx = LispContext::new();
-    let out_symbol = ctx.symbols.intern("$out");
 
     // let parse = read_expr("((() 1) (abc) 3)", &mut ctx);
     // println!("{:?}", parse);
@@ -897,19 +939,24 @@ fn main() {
     for maybe_line in io::stdin().lock().lines() {
         let line = maybe_line.unwrap();
         if let Ok(e) = read_expr(&line, &mut ctx) {
-            let out = evaluate_expression(&mut ctx, e.clone());
-            ctx.symbols.set(out_symbol.clone(), out);
+
+            let result = evaluate_expression(&mut ctx, e.clone());
+
+            match result {
+                Ok(out) => {
+
+                    // println!("Reading: `{}`", &line);
+
+                    // println!("\n------BEFORE------\n{}------------------\n", ctx);
+                    garbage_collect(&mut ctx);
+                    println!("\n------AFTER-------\n{}------------------\n", ctx.lists);
+
+                    println!("Output = {}\n", out.print(&mut ctx));
+
+                }
+                Err(error) => { println!("Error: {:?}", error); }
+            }
         }
-
-        // println!("Reading: `{}`", &line);
-
-        // println!("\n------BEFORE------\n{}------------------\n", ctx);
-        garbage_collect(&mut ctx);
-        println!("\n------AFTER-------\n{}------------------\n", ctx.lists);
-
-        println!("Output = {}\n", ctx.symbols.get(out_symbol.clone()).unwrap().print(&mut ctx));
-
     }
-
-    
 }
+
